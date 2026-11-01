@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 
 import argparse
+import ipaddress
 import logging
 import json
+import re
 import requests
 from bs4 import BeautifulSoup
-from dateutil import parser
 import os
 import sys
+from urllib.parse import quote, quote_plus
+
+REQUEST_TIMEOUT = 15
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -36,53 +40,56 @@ def setup_argparse():
     return parser.parse_args()
 
 
+def detect_indicator_type(indicator):
+    """Returns 'ip', 'hash', or 'domain' for the given indicator."""
+    try:
+        ipaddress.ip_address(indicator.strip())
+        return "ip"
+    except ValueError:
+        pass
+    if re.fullmatch(r"[A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64}", indicator.strip()):
+        return "hash"
+    return "domain"
+
+
+VT_ENDPOINTS = {"ip": "ip_addresses", "domain": "domains", "hash": "files"}
+OTX_ENDPOINTS = {"ip": "ip", "domain": "domain", "hash": "file"}
+
+
 def fetch_virustotal_reputation(indicator):
     """
     Fetches reputation data from VirusTotal for the given indicator.
-    Replace with actual VirusTotal API call and data parsing.
-    This is a placeholder.
+    The score is a reputation: 1.0 is fully benign, 0.0 is fully
+    malicious. It is the complement of the maliciousness ratio.
     """
     try:
-        # Replace with actual VirusTotal API key and endpoint
         api_key = os.environ.get("VIRUSTOTAL_API_KEY")  # Get API key from environment variable
         if not api_key:
             raise ValueError("VirusTotal API key not found in environment variables.")
-        
-        # The endpoint is the IP address form whatever the indicator is. A
-        # domain or a hash is sent down the IP path here and in the OTX call
-        # below, so the score for those inputs describes a lookup of the
-        # wrong kind, when it describes anything at all.
-        url = f"https://www.virustotal.com/api/v3/ip_addresses/{indicator}" #Example API Endpoint using IP address. Adapt if hash/domain
+
+        indicator_type = detect_indicator_type(indicator)
+        url = f"https://www.virustotal.com/api/v3/{VT_ENDPOINTS[indicator_type]}/{quote(indicator, safe='')}"
         headers = {"x-apikey": api_key}
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
         data = response.json()
 
-        # Extract relevant information (example)
-        #Adjust the below for the exact keys returned in VT response
         if 'data' in data and 'attributes' in data['data'] and 'last_analysis_stats' in data['data']['attributes']:
             stats = data['data']['attributes']['last_analysis_stats']
             malicious = stats.get('malicious', 0)
             suspicious = stats.get('suspicious', 0)
-            # The denominator sums every analysis bucket, including harmless,
-            # undetected, and timeout. A file most engines never finished with
-            # scores gentler than one a few engines flagged, because unfinished
-            # work dilutes the ratio.
             total = sum(stats.values()) #Number of engines/sources who have analyzed the indicator
-            
+
             if total > 0: #prevent ZeroDivisionError
-                reputation_score = (malicious + suspicious) / total #Very rough estimate of maliciousness
+                malicious_ratio = (malicious + suspicious) / total
+                reputation_score = 1.0 - malicious_ratio
             else:
-                reputation_score = 0.0
-            
+                return {"source": "VirusTotal", "score": None, "error": "VirusTotal returned no analysis stats.", "raw_data": data}
+
             return {"source": "VirusTotal", "score": reputation_score, "raw_data": data} #Returning the raw data, for debugging
         else:
-            logging.warning(f"Could not find reputational attributes for {indicator} in VirusTotal response. Please review response parsing.")
-            # This 0.0 is a parse failure wearing a score. Downstream it is
-            # averaged in at full weight, while a network error returns None and
-            # is skipped entirely, so the two failure kinds pull the overall
-            # number in opposite directions.
-            return {"source": "VirusTotal", "score": 0.0, "raw_data": data} #Return a score of 0.0, to indicate no score was possible, but still return data for debugging
+            logging.warning(f"Could not find reputational attributes for {indicator} in VirusTotal response. Treating the response as a lookup failure, not as a benign result.")
+            return {"source": "VirusTotal", "score": None, "error": "Malformed VirusTotal response: no last_analysis_stats.", "raw_data": data}
 
     except requests.exceptions.RequestException as e:
         logging.error(f"Error fetching data from VirusTotal: {e}")
@@ -101,8 +108,8 @@ def fetch_virustotal_reputation(indicator):
 def fetch_alienvault_otx_reputation(indicator):
     """
     Fetches reputation data from AlienVault OTX for the given indicator.
-    Replace with actual AlienVault OTX API call and data parsing.
-    This is a placeholder.
+    The score is a reputation: more pulses naming the indicator means
+    a lower score.
     """
     try:
         # Replace with actual AlienVault OTX API key and endpoint, if necessary
@@ -114,19 +121,19 @@ def fetch_alienvault_otx_reputation(indicator):
         if api_key:
              headers = {"X-OTX-API-KEY": api_key}
 
-        url = f"https://otx.alienvault.com/api/v1/indicator/ip/{indicator}" #Example endpoint, adapt for domain/hash
+        indicator_type = detect_indicator_type(indicator)
+        url = f"https://otx.alienvault.com/api/v1/indicator/{OTX_ENDPOINTS[indicator_type]}/{quote(indicator, safe='')}"
 
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
 
         data = response.json()
-        #Extracting reputation based on pulses count:
-
+        if not isinstance(data, dict) or 'pulse_info' not in data:
+            return {"source": "AlienVault OTX", "score": None, "error": "Malformed OTX response: no pulse_info.", "raw_data": data}
+        # Reputation is the complement of the pulse based risk signal:
+        # more pulses naming the indicator means lower reputation.
         pulse_count = data.get('pulse_info', {}).get('count', 0) #Get the count of pulses that have identified this indicator.
-        if pulse_count > 0:
-            reputation_score = min(pulse_count/100.0, 1.0) #Capping it at 1.0. adjust for real value scenarios.
-        else:
-            reputation_score = 0.0
+        reputation_score = 1.0 - min(pulse_count/100.0, 1.0) #Capping the risk signal at 1.0.
 
         return {"source": "AlienVault OTX", "score": reputation_score, "raw_data": data}
 
@@ -144,17 +151,13 @@ def fetch_twitter_reputation(indicator):
     """
     Fetches reputation data from Twitter (using search) for the given indicator.
     Note: This is extremely unreliable and should be used with caution.
-    Replace with a more reliable Twitter API if available and authenticated.
-    This is a placeholder and uses web scraping. Use with caution due to rate limiting and potential HTML changes.
+    It uses web scraping of the public search page. Use with caution due to rate limiting and potential HTML changes.
     """
     try:
         # Replace with actual Twitter API call and authentication if possible
         # Due to Twitter API changes, web scraping is used as a last resort (use with caution!)
-        search_url = f"https://twitter.com/search?q={indicator}&src=typed_query"
-        # No request in this file sets a timeout. One hung feed holds the
-        # whole scoring run open, since the three fetches run in sequence
-        # before any arithmetic happens.
-        response = requests.get(search_url, headers={'User-Agent': 'Mozilla/5.0'}) #User-Agent to avoid blocking
+        search_url = f"https://twitter.com/search?q={quote_plus(indicator)}&src=typed_query"
+        response = requests.get(search_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=REQUEST_TIMEOUT) #User-Agent to avoid blocking
         response.raise_for_status()
 
         soup = BeautifulSoup(response.content, 'html.parser')
@@ -162,8 +165,9 @@ def fetch_twitter_reputation(indicator):
         tweet_count = len(soup.find_all('div', class_='css-1dbjc4n r-1iusvr4 r-16y2uox r-1777f5m r-1xky4jy r-1mi0q7o r-1loqt21 r-o7ynqc r-6416eg r-1ny4l3l'))  #Attempt to extract tweet count
         #This will be very fragile!  Review output and adapt often!
 
-        #Assume more tweets == higher likelihood of indicator being noteworthy (positive or negative)
-        reputation_score = min(tweet_count / 50.0, 0.6) #Capped at 0.6 due to unreliability.
+        # More mentions are treated as a risk signal, so reputation is
+        # the complement of the mention signal, capped for unreliability.
+        reputation_score = 1.0 - min(tweet_count / 50.0, 0.6)
 
         return {"source": "Twitter", "score": reputation_score, "raw_data": f"Scraped HTML - count: {tweet_count}"}
 
@@ -195,21 +199,15 @@ def calculate_overall_reputation(source_reputations, threshold=DEFAULT_THRESHOLD
             logging.warning(f"Skipping {reputation['source']} due to missing score.")
 
     if total_weight == 0:
-        return 0.0  # No valid scores
+        return None  # No valid scores: the lookup failed, there is no reputation to report.
 
     overall_score = sum(weighted_scores) / total_weight
 
-    # Apply consensus threshold: If consensus is below the threshold, reduce the score.
-    # The threshold only chooses which log line prints. Nothing is
-    # reduced, flagged in the output JSON, or acted on, and the value is
-    # a weighted mean, not a measure of agreement between sources, so
-    # one loud source over the line reads as consensus.
+    # Scores are reputation: high is benign, low is malicious.
     if overall_score > threshold:
         logging.info(f"Reputation score above threshold {threshold}. Considered high reputation.")
     else:
-        logging.warning(f"Reputation score below threshold {threshold}. May require further investigation.")
-        #Could reduce the overall_score here, if desired, to indicate reduced confidence.  Leaving as-is for now.
-
+        logging.warning(f"Reputation score at or below threshold {threshold}. Considered low reputation: the indicator looks malicious and requires further investigation.")
 
     return overall_score
 
@@ -242,11 +240,25 @@ def main():
     # Calculate overall reputation
     overall_reputation = calculate_overall_reputation(source_reputations, args.threshold)
 
+    if overall_reputation is None:
+        logging.error("No source produced a valid score. The lookup failed, so no reputation score is reported.")
+        results = {
+            "indicator": indicator,
+            "overall_reputation": None,
+            "verdict": "lookup failed: no score",
+            "source_reputations": source_reputations
+        }
+        print(json.dumps(results, indent=4))
+        sys.exit(1)
+
     logging.info(f"Overall reputation score: {overall_reputation}")
+
+    verdict = "high reputation" if overall_reputation > args.threshold else "low reputation: malicious"
 
     results = {
         "indicator": indicator,
         "overall_reputation": overall_reputation,
+        "verdict": verdict,
         "source_reputations": source_reputations
     }
 
