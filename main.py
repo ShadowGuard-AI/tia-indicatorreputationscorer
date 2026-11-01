@@ -48,6 +48,10 @@ def fetch_virustotal_reputation(indicator):
         if not api_key:
             raise ValueError("VirusTotal API key not found in environment variables.")
         
+        # The endpoint is the IP address form whatever the indicator is. A
+        # domain or a hash is sent down the IP path here and in the OTX call
+        # below, so the score for those inputs describes a lookup of the
+        # wrong kind, when it describes anything at all.
         url = f"https://www.virustotal.com/api/v3/ip_addresses/{indicator}" #Example API Endpoint using IP address. Adapt if hash/domain
         headers = {"x-apikey": api_key}
         response = requests.get(url, headers=headers)
@@ -60,6 +64,10 @@ def fetch_virustotal_reputation(indicator):
             stats = data['data']['attributes']['last_analysis_stats']
             malicious = stats.get('malicious', 0)
             suspicious = stats.get('suspicious', 0)
+            # The denominator sums every analysis bucket, including harmless,
+            # undetected, and timeout. A file most engines never finished with
+            # scores gentler than one a few engines flagged, because unfinished
+            # work dilutes the ratio.
             total = sum(stats.values()) #Number of engines/sources who have analyzed the indicator
             
             if total > 0: #prevent ZeroDivisionError
@@ -70,6 +78,10 @@ def fetch_virustotal_reputation(indicator):
             return {"source": "VirusTotal", "score": reputation_score, "raw_data": data} #Returning the raw data, for debugging
         else:
             logging.warning(f"Could not find reputational attributes for {indicator} in VirusTotal response. Please review response parsing.")
+            # This 0.0 is a parse failure wearing a score. Downstream it is
+            # averaged in at full weight, while a network error returns None and
+            # is skipped entirely, so the two failure kinds pull the overall
+            # number in opposite directions.
             return {"source": "VirusTotal", "score": 0.0, "raw_data": data} #Return a score of 0.0, to indicate no score was possible, but still return data for debugging
 
     except requests.exceptions.RequestException as e:
@@ -139,6 +151,9 @@ def fetch_twitter_reputation(indicator):
         # Replace with actual Twitter API call and authentication if possible
         # Due to Twitter API changes, web scraping is used as a last resort (use with caution!)
         search_url = f"https://twitter.com/search?q={indicator}&src=typed_query"
+        # No request in this file sets a timeout. One hung feed holds the
+        # whole scoring run open, since the three fetches run in sequence
+        # before any arithmetic happens.
         response = requests.get(search_url, headers={'User-Agent': 'Mozilla/5.0'}) #User-Agent to avoid blocking
         response.raise_for_status()
 
@@ -185,6 +200,10 @@ def calculate_overall_reputation(source_reputations, threshold=DEFAULT_THRESHOLD
     overall_score = sum(weighted_scores) / total_weight
 
     # Apply consensus threshold: If consensus is below the threshold, reduce the score.
+    # The threshold only chooses which log line prints. Nothing is
+    # reduced, flagged in the output JSON, or acted on, and the value is
+    # a weighted mean, not a measure of agreement between sources, so
+    # one loud source over the line reads as consensus.
     if overall_score > threshold:
         logging.info(f"Reputation score above threshold {threshold}. Considered high reputation.")
     else:
